@@ -1,0 +1,8 @@
+name = "omc-odoo-telegram-bot"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+[vars]
+ODOO_URL = "https://365hub.odoo.com"
+ODOO_DB = "365hub"
+ODOO_USER = "ahmedkdk11@gmail.com"

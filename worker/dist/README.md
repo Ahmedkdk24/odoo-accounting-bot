@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "omc-odoo-telegram-bot" generated at 2026-04-29T08:35:01.169Z.
