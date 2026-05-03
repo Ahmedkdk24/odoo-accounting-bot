@@ -2,6 +2,7 @@ import route from './router.js';
 import { setTelegramToken, apiUrl } from './services/telegram.js';
 import { logInfo, logError } from './utils.js';
 import handleInvoice from './handlers/invoice.js';
+import { handleExtractPdf } from './handlers/extractPdf.js';
 
 const WEBHOOK = '/endpoint';
 
@@ -20,6 +21,7 @@ export default {
     const handlers = {
       WEBHOOK_PATH: WEBHOOK,
       handleWebhook: (request, ctx) => handleInvoice(request, env, ctx),
+      handleExtractPdf: (request, ctx) => handleExtractPdf(request, env, ctx),
       registerWebhook: (request, env, url) => registerWebhook(request, env, url),
       unRegisterWebhook: () => unRegisterWebhook()
     };

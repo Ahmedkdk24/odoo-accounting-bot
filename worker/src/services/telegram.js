@@ -27,14 +27,8 @@ export async function downloadTelegramFile(fileId) {
 
   const arrayBuffer = await fileResponse.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-
   logInfo('Downloaded Telegram file successfully');
-  return btoa(binary);
+  return bytes;
 }
 
 export async function sendPlainText(chatId, text) {

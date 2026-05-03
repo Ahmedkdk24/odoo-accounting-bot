@@ -6,3 +6,9 @@ compatibility_date = "2025-09-01"
 ODOO_URL = "https://365hub.odoo.com"
 ODOO_DB = "365hub"
 ODOO_USER = "ahmedkdk11@gmail.com"
+R2_PUBLIC_BASE_URL = "https://pub-6718a340243c486899b3b1a6e933902e.r2.dev"
+
+[[r2_buckets]]
+binding = "INVOICE_BUCKET"
+bucket_name = "omc-invoices"
+

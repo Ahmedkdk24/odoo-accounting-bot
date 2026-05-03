@@ -1,4 +1,5 @@
 import { logInfo, logWarn } from './utils.js';
+import { handleExtractPdf } from './handlers/extractPdf.js';
 
 export default async function route(request, env, ctx, handlers) {
   const url = new URL(request.url);
@@ -8,6 +9,9 @@ export default async function route(request, env, ctx, handlers) {
   switch (true) {
     case path === handlers.WEBHOOK_PATH:
       return handlers.handleWebhook(request, ctx);
+
+    case path === '/extract-pdf':
+      return await handleExtractPdf(request, env);
 
     case path === '/registerWebhook':
       return handlers.registerWebhook(request, env, url);

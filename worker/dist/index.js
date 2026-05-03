@@ -62,13 +62,8 @@ async function downloadTelegramFile(fileId) {
   }
   const arrayBuffer = await fileResponse.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
-  let binary = "";
-  const chunkSize = 32768;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
   logInfo("Downloaded Telegram file successfully");
-  return btoa(binary);
+  return bytes;
 }
 __name(downloadTelegramFile, "downloadTelegramFile");
 async function sendPlainText(chatId, text) {
@@ -23400,6 +23395,21 @@ var __webpack_exports__version = __webpack_exports__.version;
 
 // src/handlers/invoice.js
 var SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token";
+var LLM_INVOICE_PROMPT_TEXT = `You are an AI assistant that extracts structured data from invoices.
+
+Extract:
+- partner_name
+- date (YYYY-MM-DD)
+- amount (total including VAT)
+- reference (invoice number)
+- vat_no
+
+Rules:
+- Return ONLY valid JSON
+- If unsure, return null
+- Do not guess
+- Invoice may contain Arabic and English
+`;
 async function handleInvoice(request, env, ctx) {
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
@@ -23424,10 +23434,10 @@ async function handleInvoice(request, env, ctx) {
   if (message.text) {
     const text = message.text.trim();
     if (text.startsWith("/start") || text.startsWith("/help")) {
-      await sendPlainText(chatId, "Send an invoice PDF or image to create an Odoo bill.");
+      await sendPlainText(chatId, "Send an invoice PDF or image in English or Arabic to create an Odoo bill.");
       return new Response("Ok");
     }
-    await sendPlainText(chatId, "Please send a PDF or image invoice. Text messages are not processed.");
+    await sendPlainText(chatId, "Please send a PDF or image invoice in English or Arabic. Text messages are not processed.");
     return new Response("Ok");
   }
   const filePayload = getTelegramFilePayload(message);
@@ -23435,9 +23445,28 @@ async function handleInvoice(request, env, ctx) {
     await sendPlainText(chatId, "Send an invoice PDF or an invoice image to process.");
     return new Response("Ok");
   }
+
+  let r2Key = null;
+  const keepR2Objects = env.KEEP_R2_OBJECTS === "true";
+
   try {
-    const fileBase64 = await downloadTelegramFile(filePayload.fileId);
-    const extractedData = await processInvoice(fileBase64, filePayload.mimeType, env);
+    const fileData = await downloadTelegramFile(filePayload.fileId);
+    logInfo("Invoice file downloaded", filePayload.fileName, filePayload.mimeType, fileData.byteLength);
+
+    if (!env.INVOICE_BUCKET) {
+      throw new Error("Missing INVOICE_BUCKET binding");
+    }
+
+    r2Key = await uploadInvoiceToR2(fileData, filePayload.fileName, filePayload.mimeType, env);
+    const signedUrl = await createR2SignedUrl(r2Key, env, 300);
+    const extractedData = await processInvoice(fileData, filePayload.mimeType, signedUrl, env);
+
+    if (!isValidExtractedInvoiceData(extractedData)) {
+      logInfo("Invoice validation failed", JSON.stringify(extractedData));
+      await sendPlainText(chatId, "⚠️ Could not confidently extract invoice data. Please review.");
+      return new Response("Ok");
+    }
+
     const billId = await createOdooBill(extractedData, env);
     await sendPlainText(chatId, `Invoice processed successfully. Created Bill ID: ${billId}.`);
   } catch (error) {
@@ -23451,6 +23480,15 @@ async function handleInvoice(request, env, ctx) {
       await sendPlainText(chatId, `Invoice processing failed due to Groq API issue: ${message2.replace("Groq API error: ", "")}`);
     } else {
       await sendPlainText(chatId, "Invoice processing failed. Please try again.");
+    }
+  } finally {
+    if (r2Key && !keepR2Objects) {
+      try {
+        await deleteR2Object(r2Key, env);
+        logInfo("Cleaned up R2 object", r2Key);
+      } catch (cleanupError) {
+        logError("R2 cleanup failed", cleanupError);
+      }
     }
   }
   return new Response("Ok");
@@ -23482,50 +23520,208 @@ function getTelegramFilePayload(message) {
   return null;
 }
 __name(getTelegramFilePayload, "getTelegramFilePayload");
-async function processInvoice(fileBase64, mimeType, env) {
+async function processInvoice(fileData, mimeType, signedUrl, env) {
   if (!env.GROQ_API_KEY) {
     throw new Error("Missing GROQ_API_KEY secret");
   }
   const groq = new groq_sdk_default({ apiKey: env.GROQ_API_KEY });
-  let invoiceContent = "";
+  let extractedData = null;
   if (mimeType === "application/pdf") {
-    invoiceContent = await extractTextFromPDF(fileBase64);
+    const invoiceText = await extractTextFromPDF(fileData);
+    logInfo(`Extracted ${invoiceText.length} characters from PDF`);
+    extractedData = await extractDataFromText(invoiceText, groq);
   } else if (mimeType.startsWith("image/")) {
-    invoiceContent = `[Invoice Image Data - ${mimeType}]`;
+    extractedData = await extractDataFromImage(signedUrl, groq);
+  } else {
+    throw new Error(`Unsupported file type: ${mimeType}`);
   }
-  const prompt = `You are a professional Saudi accountant. Extract financial data from the following invoice (text or image). Return ONLY a valid JSON object with keys: 'partner_name', 'date' (YYYY-MM-DD), 'amount' (float), 'reference' (invoice number), 'vat_no'. Invoice content:
-${invoiceContent}`;
-  try {
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [
-        { role: "user", content: prompt }
-      ],
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
-      temperature: 1,
-      max_completion_tokens: 1024,
-      top_p: 1,
-      stream: false,
-      stop: null
-    });
-    const responseText = chatCompletion.choices[0]?.message?.content?.trim();
-    if (!responseText) {
-      throw new Error("Empty response from Groq API");
+  if (!extractedData || typeof extractedData !== "object") {
+    throw new Error("LLM returned invalid invoice data");
+  }
+  logInfo("Parsed JSON from LLM", JSON.stringify(extractedData));
+  return normalizeInvoiceData(extractedData);
+}
+
+async function extractDataFromImage(signedUrl, groq) {
+  logInfo("Sending image URL to LLM for invoice extraction");
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: LLM_INVOICE_PROMPT_TEXT
+        },
+        {
+          type: "image_url",
+          image_url: { url: signedUrl }
+        }
+      ]
     }
-    if (responseText.toLowerCase().includes("error") || responseText.toLowerCase().includes("code:")) {
-      throw new Error(`Groq API error: ${responseText}`);
+  ];
+  return await callGroqExtraction(groq, messages);
+}
+
+async function extractDataFromText(text, groq) {
+  logInfo("Sending PDF text to LLM for invoice extraction");
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: LLM_INVOICE_PROMPT_TEXT
+        },
+        {
+          type: "text",
+          text: `Invoice text:\n${text}`
+        }
+      ]
     }
-    return parseAiJson(responseText);
-  } catch (error) {
-    const message = error?.message || String(error);
-    if (/401|PERMISSION_DENIED|Unauthorized|API key/i.test(message)) {
-      throw new Error(`Groq API key rejected: ${message}`);
+  ];
+  return await callGroqExtraction(groq, messages);
+}
+
+async function callGroqExtraction(groq, messages, maxRetries = 1) {
+  const body = {
+    messages,
+    model: "meta-llama/llama-4-scout-17b-16e-instruct",
+    temperature: 0,
+    max_completion_tokens: 2048,
+    top_p: 1,
+    stream: false,
+    stop: null
+  };
+  let attempt = 0;
+  while (true) {
+    try {
+      logInfo(`LLM request sent (attempt ${attempt + 1})`);
+      const chatCompletion = await groq.chat.completions.create(body);
+      const responseText = chatCompletion.choices?.[0]?.message?.content?.trim();
+      logInfo("Raw LLM response received");
+      logInfo(`Raw LLM response: ${responseText?.substring(0, 500)}`);
+      if (!responseText) {
+        throw new Error("Empty response from Groq API");
+      }
+      return parseAiJson(responseText);
+    } catch (error) {
+      const message = error?.message || String(error);
+      logError("Groq API call failed", error);
+      if (attempt >= maxRetries) {
+        if (/401|PERMISSION_DENIED|Unauthorized|API key/i.test(message)) {
+          throw new Error(`Groq API key rejected: ${message}`);
+        }
+        if (/503|Service Unavailable|UNAVAILABLE|timeout/i.test(message)) {
+          throw new Error(`Groq API unavailable: ${message}`);
+        }
+        throw error;
+      }
+      attempt += 1;
+      logInfo(`Retrying LLM request (${attempt}/${maxRetries})`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    if (/503|Service Unavailable|UNAVAILABLE|timeout/i.test(message)) {
-      throw new Error(`Groq API unavailable: ${message}`);
-    }
-    throw error;
   }
 }
+
+async function uploadInvoiceToR2(fileData, fileName, contentType, env) {
+  const extension = getFileExtension(fileName) || getExtensionFromMime(contentType) || "jpg";
+  const key = `invoices/${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  const putResult = await env.INVOICE_BUCKET.put(key, fileData, {
+    httpMetadata: { contentType }
+  });
+  if (!putResult) {
+    throw new Error("R2 upload failed");
+  }
+  logInfo("R2 upload success", key);
+  return key;
+}
+
+async function createR2SignedUrl(key, env, expiresSeconds = 300) {
+  if (!env.INVOICE_BUCKET) {
+    throw new Error("Missing INVOICE_BUCKET binding");
+  }
+  if (typeof env.INVOICE_BUCKET.getSignedUrl !== "function") {
+    throw new Error("R2 signed URL generation is not supported in this environment");
+  }
+  const signedUrl = await env.INVOICE_BUCKET.getSignedUrl(key, { expires: expiresSeconds });
+  if (!signedUrl) {
+    throw new Error("Failed to generate R2 signed URL");
+  }
+  logInfo("Signed URL generated", signedUrl, `expires=${expiresSeconds}`);
+  return signedUrl;
+}
+
+async function deleteR2Object(key, env) {
+  if (!env.INVOICE_BUCKET) {
+    return;
+  }
+  await env.INVOICE_BUCKET.delete(key);
+}
+
+function getFileExtension(fileName) {
+  const match = String(fileName || "").match(/\.([a-zA-Z0-9]+)$/);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function getExtensionFromMime(mimeType) {
+  if (!mimeType) return null;
+  const normalized = mimeType.toLowerCase();
+  if (normalized === "image/jpeg") return "jpg";
+  if (normalized === "image/png") return "png";
+  if (normalized === "image/webp") return "webp";
+  if (normalized === "application/pdf") return "pdf";
+  return null;
+}
+
+function normalizeInvoiceData(data) {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+  return {
+    partner_name: normalizeString(data.partner_name),
+    date: normalizeString(data.date),
+    amount: normalizeAmount(data.amount),
+    reference: normalizeString(data.reference),
+    vat_no: normalizeString(data.vat_no)
+  };
+}
+
+function normalizeString(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+function normalizeAmount(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return parseNumberString(value);
+  }
+  return null;
+}
+
+function parseNumberString(value) {
+  const normalized = String(value).trim().replace(/,/g, "");
+  const arabicDigits = normalized
+    .replace(/[٠١٢٣٤٥٦٧٨٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d))
+    .replace(/[۰۱۲۳۴۵۶۷۸۹]/g, (d) => "۰۱۲۳۴۵۶۷۸۹".indexOf(d));
+  const number = Number(arabicDigits);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function isValidExtractedInvoiceData(data) {
+  return !!data &&
+    typeof data.partner_name === "string" && data.partner_name.length > 0 &&
+    typeof data.amount === "number" && data.amount > 0;
+}
+
 __name(processInvoice, "processInvoice");
 function parseAiJson(rawText) {
   const text = rawText?.trim();
@@ -23546,8 +23742,8 @@ function parseAiJson(rawText) {
   }
 }
 __name(parseAiJson, "parseAiJson");
-async function extractTextFromPDF(base64Data) {
-  const pdfData = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0));
+async function extractTextFromPDF(fileData) {
+  const pdfData = fileData instanceof Uint8Array ? fileData : new Uint8Array(fileData);
   const pdf = await __webpack_exports__getDocument({ data: pdfData }).promise;
   let fullText = "";
   for (let i = 1; i <= pdf.numPages; i++) {

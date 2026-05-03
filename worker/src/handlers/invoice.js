@@ -1,9 +1,130 @@
+// Robust date normalization for LLM output
+function normalizeDate(value) {
+  if (!value || typeof value !== 'string') return null;
+  let str = value.trim();
+  // Try ISO first
+  let date = new Date(str);
+  if (!isNaN(date)) {
+    return date.toISOString().slice(0, 10);
+  }
+  // Try to handle common natural language formats
+  // Remove commas, handle Arabic/English months
+  str = str.replace(/،/g, ',').replace(/,/g, '').replace(/\s+/g, ' ');
+  // English months
+  const months = {
+    'january': 0, 'jan': 0,
+    'february': 1, 'feb': 1,
+    'march': 2, 'mar': 2,
+    'april': 3, 'apr': 3,
+    'may': 4,
+    'june': 5, 'jun': 5,
+    'july': 6, 'jul': 6,
+    'august': 7, 'aug': 7,
+    'september': 8, 'sep': 8, 'sept': 8,
+    'october': 9, 'oct': 9,
+    'november': 10, 'nov': 10,
+    'december': 11, 'dec': 11
+  };
+  // Arabic months (basic)
+  const arMonths = {
+    'يناير': 0, 'فبراير': 1, 'مارس': 2, 'أبريل': 3, 'ابريل': 3, 'مايو': 4, 'يونيو': 5, 'يوليو': 6, 'أغسطس': 7, 'اغسطس': 7, 'سبتمبر': 8, 'أكتوبر': 9, 'اكتوبر': 9, 'نوفمبر': 10, 'ديسمبر': 11
+  };
+  // Try DD Month YYYY
+  let match = str.match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
+  if (match) {
+    const day = parseInt(match[1], 10);
+    const month = months[match[2].toLowerCase()];
+    const year = parseInt(match[3], 10);
+    if (month !== undefined) {
+      date = new Date(year, month, day);
+      if (!isNaN(date)) return date.toISOString().slice(0, 10);
+    }
+  }
+  // Try DD Month, YYYY
+  match = str.match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
+  if (match) {
+    const day = parseInt(match[1], 10);
+    const month = months[match[2].toLowerCase()];
+    const year = parseInt(match[3], 10);
+    if (month !== undefined) {
+      date = new Date(year, month, day);
+      if (!isNaN(date)) return date.toISOString().slice(0, 10);
+    }
+  }
+  // Try DD Month YYYY (Arabic)
+  match = str.match(/(\d{1,2})\s+([\u0600-\u06FF]+)\s+(\d{4})/);
+  if (match) {
+    const day = parseInt(match[1], 10);
+    const month = arMonths[match[2]];
+    const year = parseInt(match[3], 10);
+    if (month !== undefined) {
+      date = new Date(year, month, day);
+      if (!isNaN(date)) return date.toISOString().slice(0, 10);
+    }
+  }
+  // Try YYYY-MM-DD
+  match = str.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (match) {
+    date = new Date(match[0]);
+    if (!isNaN(date)) return date.toISOString().slice(0, 10);
+  }
+  // Try fallback: parse numbers
+  match = str.match(/(\d{1,2})[\s/-]+([A-Za-z\u0600-\u06FF]+)[\s/-]+(\d{4})/);
+  if (match) {
+    const day = parseInt(match[1], 10);
+    const m = match[2];
+    const year = parseInt(match[3], 10);
+    let month = months[m.toLowerCase()];
+    if (month === undefined) month = arMonths[m];
+    if (month !== undefined) {
+      date = new Date(year, month, day);
+      if (!isNaN(date)) return date.toISOString().slice(0, 10);
+    }
+  }
+  logError('Invalid date format from LLM', value);
+  return null;
+}
 import { logInfo, logError } from '../utils.js';
 import { downloadTelegramFile, sendPlainText } from '../services/telegram.js';
+import { convertPdfToImage } from './cloudconvert.js';
 import Groq from 'groq-sdk';
-import * as pdfjsLib from 'pdfjs-dist';
-
 const SECRET_HEADER = 'X-Telegram-Bot-Api-Secret-Token';
+
+const LLM_INVOICE_ONE_SHOT_PROMPT = `
+Extract structured accounting data directly from the image.
+
+CRITICAL RULES:
+- Output ONLY valid JSON
+- Do NOT describe the image
+- Do NOT explain anything
+- Do NOT include markdown
+- If you cannot extract, return empty fields but STILL return JSON
+
+FORMAT:
+
+{
+  "partner_name": "",
+  "date": "",
+  "reference": "",
+  "vat_no": "",
+  "amount": 0,
+  "lines": [
+    {
+      "name": "",
+      "quantity": 0,
+      "unit_price": 0,
+      "total": 0
+    }
+  ]
+}
+
+Arabic hints:
+- الكمية = quantity
+- السعر = unit_price
+- الإجمالي = total
+`;
+
+
 
 export default async function handleInvoice(request, env, ctx) {
   if (request.method !== 'POST') {
@@ -33,10 +154,10 @@ export default async function handleInvoice(request, env, ctx) {
   if (message.text) {
     const text = message.text.trim();
     if (text.startsWith('/start') || text.startsWith('/help')) {
-      await sendPlainText(chatId, 'Send an invoice PDF or image to create an Odoo bill.');
+      await sendPlainText(chatId, 'Send an invoice PDF or image in English or Arabic to create an Odoo bill.');
       return new Response('Ok');
     }
-    await sendPlainText(chatId, 'Please send a PDF or image invoice. Text messages are not processed.');
+    await sendPlainText(chatId, 'Please send a PDF or image invoice in English or Arabic. Text messages are not processed.');
     return new Response('Ok');
   }
 
@@ -46,9 +167,32 @@ export default async function handleInvoice(request, env, ctx) {
     return new Response('Ok');
   }
 
+  let r2Key = null;
+  const keepR2Objects = env.KEEP_R2_OBJECTS === 'true';
+
   try {
-    const fileBase64 = await downloadTelegramFile(filePayload.fileId);
-    const extractedData = await processInvoice(fileBase64, filePayload.mimeType, env);
+    const fileData = await downloadTelegramFile(filePayload.fileId);
+    logInfo('Invoice file downloaded', filePayload.fileName, filePayload.mimeType, fileData.byteLength);
+
+    if (!env.INVOICE_BUCKET) {
+      throw new Error('Missing INVOICE_BUCKET binding');
+    }
+    if (!env.R2_PUBLIC_BASE_URL) {
+      throw new Error('Missing R2_PUBLIC_BASE_URL');
+    }
+
+    r2Key = await uploadInvoiceToR2(fileData, filePayload.fileName, filePayload.mimeType, env);
+    const imageUrl = getR2PublicUrl(r2Key, env);
+    logInfo('Constructed imageUrl', imageUrl);
+
+    const extractedData = await processInvoice(request, fileData, filePayload.mimeType, imageUrl, env);
+
+    if (!isValidExtractedInvoiceData(extractedData)) {
+      logInfo('Invoice validation failed', JSON.stringify(extractedData));
+      await sendPlainText(chatId, '⚠️ Could not confidently extract invoice data. Please review.');
+      return new Response('Ok');
+    }
+
     const billId = await createOdooBill(extractedData, env);
     await sendPlainText(chatId, `Invoice processed successfully. Created Bill ID: ${billId}.`);
   } catch (error) {
@@ -62,6 +206,15 @@ export default async function handleInvoice(request, env, ctx) {
       await sendPlainText(chatId, `Invoice processing failed due to Groq API issue: ${message.replace('Groq API error: ', '')}`);
     } else {
       await sendPlainText(chatId, 'Invoice processing failed. Please try again.');
+    }
+  } finally {
+    if (r2Key && !keepR2Objects) {
+      try {
+        await deleteR2Object(r2Key, env);
+        logInfo('Cleaned up R2 object', r2Key);
+      } catch (cleanupError) {
+        logError('R2 cleanup failed', cleanupError);
+      }
     }
   }
 
@@ -97,60 +250,322 @@ function getTelegramFilePayload(message) {
   return null;
 }
 
-async function processInvoice(fileBase64, mimeType, env) {
+async function processInvoice(request, fileData, mimeType, imageUrl, env) {
   if (!env.GROQ_API_KEY) {
     throw new Error('Missing GROQ_API_KEY secret');
   }
 
   const groq = new Groq({ apiKey: env.GROQ_API_KEY });
-  
-  let invoiceContent = '';
-  
-  if (mimeType === 'application/pdf') {
-    invoiceContent = await extractTextFromPDF(fileBase64);
-  } else if (mimeType.startsWith('image/')) {
-    invoiceContent = await extractTextFromImage(fileBase64, mimeType, env);
+  let extractedData = null;
+
+  // IMAGE PIPELINE (existing, untouched)
+  if (mimeType.startsWith('image/')) {
+    logInfo('Processing image invoice');
+    if (!imageUrl) {
+      throw new Error('Missing image URL for image invoice');
+    }
+    extractedData = await extractDataFromImage(imageUrl, groq);
+  }
+  // PDF PIPELINE (CloudConvert PDF to image, then single Groq call)
+  else if (mimeType === 'application/pdf') {
+    logInfo('Processing PDF invoice via CloudConvert', imageUrl);
+    try {
+      const apiKey = env.CLOUDCONVERT_API_KEY;
+      if (!apiKey) throw new Error('Missing CloudConvert API key');
+      const imageUrlFromPdf = await convertPdfToImage(imageUrl, apiKey);
+      logInfo('CloudConvert PDF->image result', imageUrlFromPdf);
+
+      const messages = [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: LLM_INVOICE_ONE_SHOT_PROMPT },
+            { type: 'image_url', image_url: { url: imageUrlFromPdf } }
+          ]
+        }
+      ];
+
+      extractedData = await callGroqExtraction(groq, messages);
+
+    } catch (pdfError) {
+      logError('CloudConvert PDF->image failed', pdfError);
+      throw new Error(`PDF to image conversion failed: ${pdfError.message}`);
+    }
+  }
+  // UNSUPPORTED TYPE
+  else {
+    throw new Error(`Unsupported file type: ${mimeType}`);
   }
 
+  if (!extractedData || typeof extractedData !== 'object') {
+    throw new Error('LLM returned invalid invoice data');
+  }
+
+  logInfo('Parsed JSON from LLM', JSON.stringify(extractedData));
+  return normalizeInvoiceData(extractedData);
+}
+
+async function extractDataFromImage(imageUrl, groq) {
+  logInfo('Sending image URL to LLM for invoice extraction');
+  logInfo('LLM image request', imageUrl);
   const messages = [
     {
+      role: 'system',
+      content: `
+  You are a strict JSON API.
+
+  You NEVER describe images.
+  You NEVER explain.
+  You ONLY return valid JSON.
+
+  If output is not JSON, the system will fail.
+  `
+    },
+    {
       role: 'user',
-      content: `You are a professional Saudi accountant. Extract financial data from the following invoice text. Return ONLY a valid JSON object with keys: 'partner_name', 'date' (YYYY-MM-DD), 'amount' (float), 'reference' (invoice number), 'vat_no'. Do not include any explanation, markdown, code fences, or extra text. Invoice text:\n${invoiceContent}`
+      content: [
+        { type: 'text', text: LLM_INVOICE_ONE_SHOT_PROMPT },
+        { type: 'image_url', image_url: { url: imageUrl } }
+      ]
     }
   ];
 
-  try {
-    logInfo(`Sending request to Groq with ${messages.length} messages`);
-    const chatCompletion = await groq.chat.completions.create({
-      messages: messages,
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-      temperature: 1,
-      max_completion_tokens: 2048,
-      top_p: 1,
-      stream: false,
-      stop: null
-    });
+  return await callGroqExtraction(groq, messages);
+}
 
-    logInfo('Groq API call successful');
-    const responseText = chatCompletion.choices[0]?.message?.content?.trim();
-    if (!responseText) {
-      throw new Error('Empty response from Groq API');
+async function extractDataFromText(text, groq) {
+  logInfo('Sending PDF text to LLM for invoice extraction');
+  const messages = [
+    {
+      role: 'user',
+      content: [
+          {
+            type: 'text',
+            text: ''
+          },
+        {
+          type: 'text',
+          text: `Invoice text:\n${text}`
+        }
+      ]
     }
+  ];
 
-    logInfo(`Groq response length: ${responseText.length}`);
-    logInfo(`Groq preview: ${responseText.substring(0, 200)}...`);
-    return parseAiJson(responseText);
-  } catch (error) {
-    logError('Groq API call failed', error);
-    const message = error?.message || String(error);
-    if (/401|PERMISSION_DENIED|Unauthorized|API key/i.test(message)) {
-      throw new Error(`Groq API key rejected: ${message}`);
+  return await callGroqExtraction(groq, messages);
+}
+
+async function callGroqExtraction(groq, messages, maxRetries = 1) {
+  const requestBody = {
+    messages,
+    model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+    temperature: 0,
+    max_completion_tokens: 2048,
+    top_p: 1,
+    stream: false,
+    stop: null
+  };
+
+  let attempt = 0;
+  while (true) {
+    try {
+      logInfo(`LLM request sent (attempt ${attempt + 1})`);
+      const chatCompletion = await groq.chat.completions.create(requestBody);
+      let responseText = chatCompletion.choices?.[0]?.message?.content;
+      
+      if (typeof responseText === 'string') {
+        const trimmed = responseText.trim();
+        const encoded = new TextEncoder().encode(trimmed);
+        responseText = new TextDecoder('utf-8').decode(encoded);
+      }
+      
+      responseText = responseText?.trim();
+      logInfo('Raw LLM response received');
+      logInfo(`Raw LLM response: ${responseText?.substring(0, 500)}`);
+
+      if (!responseText) {
+        throw new Error('Empty response from Groq API');
+      }
+
+      const sanitized = sanitizeJsonResponse(responseText);
+      logInfo('Sanitized LLM response', sanitized.substring(0, 500));
+
+      const parsed = parseJsonFromString(sanitized) || tryParseJsonCandidate(sanitized);
+      if (parsed) {
+        logInfo('Successfully parsed LLM response to JSON', JSON.stringify(parsed));
+        return parsed;
+      }
+
+      // 👇 ADD THIS BLOCK HERE
+      if (!parsed) {
+        logInfo('Initial JSON parse failed. Attempting repair step...');
+
+        const repairMessages = [
+          {
+            role: 'system',
+            content: 'Convert the following text into valid JSON only. No explanation.'
+          },
+          {
+            role: 'user',
+            content: sanitized
+          }
+        ];
+
+        try {
+          const repairResponse = await groq.chat.completions.create({
+            messages: repairMessages,
+            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+            temperature: 0
+          });
+
+          const repairText = repairResponse.choices?.[0]?.message?.content?.trim();
+
+          const repairedParsed =
+            parseJsonFromString(repairText) ||
+            tryParseJsonCandidate(repairText);
+
+          if (repairedParsed) {
+            logInfo('Repair step succeeded', JSON.stringify(repairedParsed));
+            return repairedParsed;
+          }
+
+        } catch (repairError) {
+          logError('Repair step failed', repairError);
+        }
+      }
+
+      // 👇 ONLY FAIL AFTER BOTH ATTEMPTS
+      throw new Error(`JSON parse failed even after repair. Text: ${sanitized.substring(0, 200)}`);
+
+      throw new Error(`LLM did not return JSON or JSON parse failed. Text: ${sanitized.substring(0, 200)}`);
+    } catch (error) {
+      const message = error?.message || String(error);
+      logError('Groq extraction failed', error);
+
+      if (attempt >= maxRetries) {
+        if (/401|PERMISSION_DENIED|Unauthorized|API key/i.test(message)) {
+          throw new Error(`Groq API key rejected: ${message}`);
+        }
+        if (/503|Service Unavailable|UNAVAILABLE|timeout/i.test(message)) {
+          throw new Error(`Groq API unavailable: ${message}`);
+        }
+        if (/JSON parse|parse failed/i.test(message)) {
+          throw new Error(`Failed to parse invoice data from LLM after ${attempt + 1} attempts`);
+        }
+        throw error;
+      }
+
+      attempt += 1;
+      logInfo(`Retrying LLM extraction (${attempt}/${maxRetries})`);
+      await delay(500);
     }
-    if (/503|Service Unavailable|UNAVAILABLE|timeout/i.test(message)) {
-      throw new Error(`Groq API unavailable: ${message}`);
-    }
-    throw error;
   }
+}
+
+async function uploadInvoiceToR2(fileData, fileName, contentType, env) {
+  const extension = getFileExtension(fileName) || getExtensionFromMime(contentType) || 'jpg';
+  const key = `invoices/${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  const putResult = await env.INVOICE_BUCKET.put(key, fileData, {
+    httpMetadata: { contentType }
+  });
+  if (!putResult) {
+    throw new Error('R2 upload failed');
+  }
+  logInfo('R2 upload success', key);
+  return key;
+}
+
+async function deleteR2Object(key, env) {
+  if (!env.INVOICE_BUCKET) {
+    return;
+  }
+  await env.INVOICE_BUCKET.delete(key);
+}
+
+function getR2PublicUrl(key, env) {
+  if (!env.R2_PUBLIC_BASE_URL) {
+    throw new Error('Missing R2_PUBLIC_BASE_URL');
+  }
+  const publicBaseUrl = String(env.R2_PUBLIC_BASE_URL).replace(/\/$/, '');
+  return `${publicBaseUrl}/${key}`;
+}
+
+function getFileExtension(fileName) {
+  const match = String(fileName || '').match(/\.([a-zA-Z0-9]+)$/);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function getExtensionFromMime(mimeType) {
+  if (!mimeType) return null;
+  const normalized = mimeType.toLowerCase();
+  if (normalized === 'image/jpeg') return 'jpg';
+  if (normalized === 'image/png') return 'png';
+  if (normalized === 'image/webp') return 'webp';
+  if (normalized === 'application/pdf') return 'pdf';
+  return null;
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeInvoiceData(data) {
+  if (!data || typeof data !== 'object') {
+    return null;
+  }
+
+  // If data has a 'header' property, extract from it
+  const header = data.header || data;
+  const lines = Array.isArray(data.lines) ? data.lines : [];
+  // If no lines, but raw_lines exist, pass them through for next step
+  const raw_lines = Array.isArray(data.raw_lines) ? data.raw_lines : undefined;
+
+  return {
+    partner_name: normalizeString(header.partner_name),
+    date: normalizeDate(header.date),
+    amount: normalizeAmount(header.amount),
+    reference: normalizeString(header.reference),
+    vat_no: normalizeString(header.vat_no),
+    lines,
+    ...(raw_lines ? { raw_lines } : {})
+  };
+}
+
+function normalizeString(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+function normalizeAmount(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return parseNumberString(value);
+  }
+  return null;
+}
+
+function parseNumberString(value) {
+  const normalized = String(value).trim().replace(/,/g, '');
+  const arabicDigits = normalized
+    .replace(/[٠١٢٣٤٥٦٧٨٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+    .replace(/[۰۱۲۳۴۵۶۷۸۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d));
+  const number = Number(arabicDigits);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function isValidExtractedInvoiceData(data) {
+  return !!data &&
+    typeof data.partner_name === 'string' && data.partner_name.length > 0 &&
+    typeof data.amount === 'number' &&
+    Array.isArray(data.lines) &&
+    data.lines.length > 0 && data.amount > 0;
 }
 
 function tryParseJsonCandidate(candidate) {
@@ -204,6 +619,25 @@ function parseJsonFromString(text) {
   }
 
   return null;
+}
+
+function sanitizeJsonResponse(text) {
+  let sanitized = text
+    .replace(/`json|`/g, '')
+    .replace(/```/g, '')
+    .trim();
+
+  // Remove any leading text before the first '{'
+  const firstBrace = sanitized.indexOf('{');
+  if (firstBrace > 0) {
+    sanitized = sanitized.slice(firstBrace);
+  }
+
+  sanitized = sanitized
+    .replace(/(\d+)\.(\d{3})\.(\d+)/g, '$1$2.$3')
+    .replace(/(\d)_(\d)/g, '$1$2');
+
+  return sanitized;
 }
 
 function parseAiJson(rawText) {
@@ -277,65 +711,7 @@ function validateOdooConfig(env) {
   }
 }
 
-async function extractTextFromPDF(base64Data) {
-  const pdfData = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
-  const pdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
-  let fullText = '';
 
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const textContent = await page.getTextContent();
-    const pageText = textContent.items.map(item => item.str).join(' ');
-    fullText += pageText + '\n';
-  }
-
-  return fullText;
-}
-
-async function extractTextFromImage(base64Data, mimeType, env) {
-  const normalizedMime = mimeType || 'image/jpeg';
-  const apiKey = env.OCR_SPACE_API_KEY || 'helloworld'; // 'helloworld' for anonymous usage
-  const language = env.OCR_SPACE_LANGUAGE || 'eng';
-
-  const doOcr = async (lang) => {
-    const formData = new FormData();
-    formData.append('base64Image', `data:${normalizedMime};base64,${base64Data}`);
-    formData.append('language', lang);
-    formData.append('isOverlayRequired', 'false');
-    formData.append('isCreateSearchablePdf', 'false');
-    formData.append('isSearchablePdfHideTextLayer', 'true');
-    formData.append('apikey', apiKey);
-
-    const response = await fetch('https://api.ocr.space/parse/image', {
-      method: 'POST',
-      body: formData
-    });
-
-    const result = await response.json();
-    logInfo(`OCR.space response: ${JSON.stringify(result).substring(0, 500)}`);
-
-    if (!result.IsErroredOnProcessing && result.ParsedResults && result.ParsedResults.length > 0) {
-      return result.ParsedResults[0].ParsedText;
-    }
-
-    const errorMessage = Array.isArray(result.ErrorMessage)
-      ? result.ErrorMessage.join('; ')
-      : result.ErrorMessage || 'Unknown error';
-    const errorDetails = result.ErrorDetails ? ` Details: ${result.ErrorDetails}` : '';
-    throw new Error(`OCR failed: ${errorMessage}${errorDetails}`);
-  };
-
-  try {
-    return await doOcr(language);
-  } catch (error) {
-    if (error.message.includes("parameter 'language'") && language.includes('+')) {
-      const fallbackLanguage = language.split('+')[0];
-      logInfo(`OCR.space invalid language '${language}', retrying with '${fallbackLanguage}'`);
-      return await doOcr(fallbackLanguage);
-    }
-    throw error;
-  }
-}
 
 async function createOdooBill(extractedData, env) {
   validateOdooConfig(env);
@@ -359,7 +735,6 @@ async function createOdooBill(extractedData, env) {
   });
 
   logInfo(`Odoo auth target: ${url}/web/session/authenticate, db=${db}, user=${username}`);
-  logInfo(`Odoo auth request body: ${authRequestBody}`);
   const authResponse = await fetch(`${url}/web/session/authenticate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -409,14 +784,19 @@ async function createOdooBill(extractedData, env) {
     partner_id: partnerIds[0],
     invoice_date: extractedData.date,
     ref: extractedData.reference,
-    invoice_line_ids: [[0, 0, {
+    invoice_line_ids: extractedData.lines.map(line => [0, 0, {
       product_id: productIds[0],
-      name: 'AI Automated Entry / إدخال آلي',
-      quantity: 1,
-      price_unit: parseFloat(extractedData.amount)
-    }]]
+      name: line.name || 'AI Line',
+      quantity: line.quantity || 1,
+      price_unit: line.unit_price || 0
+    }])
+    
   };
 
+  const sum = extractedData.lines.reduce((s, l) => s + (l.total || 0), 0);
+  if (Math.abs(sum - extractedData.amount) > 10000) {
+    logError('Line totals mismatch invoice total', { sum, amount: extractedData.amount });
+  }
   return await odooCall('account.move', 'create', [billVals], {}, url, db, uid, password, sessionId, cookieHeader);
 }
 
