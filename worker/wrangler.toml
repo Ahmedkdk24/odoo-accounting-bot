@@ -1,14 +1,16 @@
 name = "omc-odoo-telegram-bot"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
-
 [vars]
-ODOO_URL = "https://365hub.odoo.com"
-ODOO_DB = "365hub"
-ODOO_USER = "ahmedkdk11@gmail.com"
+ODOO_URL = "https://almona.odoo-house.com"
+ODOO_DB = "almona-5April"
+ODOO_USER = "ahmed"
 R2_PUBLIC_BASE_URL = "https://pub-6718a340243c486899b3b1a6e933902e.r2.dev"
 
 [[r2_buckets]]
 binding = "INVOICE_BUCKET"
 bucket_name = "omc-invoices"
 
+[[kv_namespaces]]
+binding = "ALLOWED_USERS"
+id = "d7808e25b1924f86a094d16619581726"

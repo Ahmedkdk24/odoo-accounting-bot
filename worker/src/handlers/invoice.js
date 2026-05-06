@@ -136,6 +136,7 @@ export default async function handleInvoice(request, env, ctx) {
     return new Response('Unauthorized', { status: 403 });
   }
 
+
   let update;
   try {
     update = await request.json();
@@ -147,6 +148,28 @@ export default async function handleInvoice(request, env, ctx) {
   const message = update.message;
   if (!message) {
     logInfo('Webhook update has no message');
+    return new Response('Ok');
+  }
+
+  // --- Cloudflare KV user check ---
+  const userId = message.from?.id?.toString();
+  if (!userId) {
+    await sendPlainText(message.chat.id, '⛔ Access denied: No user ID');
+    return new Response('Ok');
+  }
+
+  // Check if ALLOWED_USERS KV binding exists
+  if (!env.ALLOWED_USERS) {
+    logError('ALLOWED_USERS KV binding is not configured');
+    await sendPlainText(message.chat.id, '⛔ Access system unavailable');
+    return new Response('Ok');
+  }
+
+  // Check if user is registered in KV namespace
+  const isAllowed = await env.ALLOWED_USERS.get(userId);
+  if (!isAllowed) {
+    logInfo(`Access denied for user ${userId}`);
+    await sendPlainText(message.chat.id, '⛔ Access denied');
     return new Response('Ok');
   }
 
@@ -773,25 +796,36 @@ async function createOdooBill(extractedData, env) {
   }
 
   // Find product
-  const productIds = await odooCall('product.product', 'search', [[['name', '=', 'AI Automated Entry']]], { limit: 1 }, url, db, uid, password, sessionId, cookieHeader);
-  if (!productIds.length) {
-    throw new Error('Product "AI Automated Entry" not found');
-  }
+
+    // Find or create product for each line
+    const getProductId = async (line) => {
+      let productIds = await odooCall('product.product', 'search', [[['name', 'ilike', line.name]]], { limit: 1 }, url, db, uid, password, sessionId, cookieHeader);
+      if (!productIds.length) {
+        productIds = [await odooCall('product.product', 'create', [{ name: line.name }], {}, url, db, uid, password, sessionId, cookieHeader)];
+      }
+      return productIds[0];
+    };
 
   // Create bill
-  const billVals = {
-    move_type: 'in_invoice',
-    partner_id: partnerIds[0],
-    invoice_date: extractedData.date,
-    ref: extractedData.reference,
-    invoice_line_ids: extractedData.lines.map(line => [0, 0, {
-      product_id: productIds[0],
-      name: line.name || 'AI Line',
-      quantity: line.quantity || 1,
-      price_unit: line.unit_price || 0
-    }])
-    
-  };
+
+    // Create bill
+    const invoiceLines = [];
+    for (const line of extractedData.lines) {
+      const productId = await getProductId(line);
+      invoiceLines.push([0, 0, {
+        product_id: productId,
+        name: line.name || 'AI Line',
+        quantity: line.quantity || 1,
+        price_unit: line.unit_price || 0
+      }]);
+    }
+    const billVals = {
+      move_type: 'in_invoice',
+      partner_id: partnerIds[0],
+      invoice_date: extractedData.date,
+      ref: extractedData.reference,
+      invoice_line_ids: invoiceLines
+    };
 
   const sum = extractedData.lines.reduce((s, l) => s + (l.total || 0), 0);
   if (Math.abs(sum - extractedData.amount) > 10000) {
